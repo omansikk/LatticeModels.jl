@@ -41,8 +41,8 @@ end
 Compute the bipartite von Neumann entanglement entropy. Defaults to half a chain (`sites = Integer(ceil(basis.L / 2)))`).
 """
 function entropy(basis::Union{Basis_constant_N, Basis_global_max_N}, state; sites = Integer(ceil(basis.L / 2)))
-    sub_dim = dimension_global_max_N(sites, N)
-    schmidt = zeros(ComplexF64, sub_dim, dimension_global_max_N(L - sites, N))
+    sub_dim = dimension_global_max_N(sites, basis.N)
+    schmidt = zeros(ComplexF64, sub_dim, dimension_global_max_N(basis.L - sites, basis.N))
     for i in 1:length(basis)
         schmidt[find_index_global_max_N(basis[i][1:sites]), find_index_global_max_N(basis_vector[sites + 1: end])] = state[i]
     end
@@ -52,8 +52,8 @@ end
 
 
 function entropy(basis::Basis_local_max_N, state; sites = Integer(ceil(basis.L / 2)))
-    sub_dim = dimension_local_max_N(sites, N)
-    schmidt = zeros(ComplexF64, sub_dim, dimension_local_max_N(L - sites, N))
+    sub_dim = dimension_local_max_N(sites, basis.N)
+    schmidt = zeros(ComplexF64, sub_dim, dimension_local_max_N(basis.L - sites, basis.N))
     for i in 1:length(basis)
         schmidt[find_index_local_max_N(basis[i][1:sites]), find_index_local_max_N(basis_vector[sites + 1: end])] = state[i]
     end
