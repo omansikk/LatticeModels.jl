@@ -338,7 +338,7 @@ end
 
 
 """
-anharmonicity_disorder(basis::Basis; pattern = 2. .* rand(basis.L) .- 1.)`
+`anharmonicity_disorder(basis::Basis; pattern = 2. .* rand(basis.L) .- 1.)`
 
 Construct a sparse matrix representation of on-site anharmonicity disorder
 ``
@@ -347,4 +347,22 @@ Construct a sparse matrix representation of on-site anharmonicity disorder
 """
 function anharmonicity_disorder(basis::Basis; pattern = 2. .* rand(basis.L) .- 1)
     return operator(basis, fock -> (fock, -0.5 * sum(pattern .* (fock.^2 .- fock))))
+end
+
+
+"""
+`vectorize(M)`
+
+Returns a vectorized form of the matrix M
+"""
+function vectorize(M)
+    d = size(M, 1)
+    v = zeros(typeof(M[1, 1]), d^2)
+    for i in 1:d
+        for j in 1:d
+            v[i + d * (j - 1)] = M[i, j]
+        end
+    end
+
+    return v
 end
