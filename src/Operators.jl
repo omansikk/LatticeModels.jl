@@ -137,7 +137,7 @@ function hops(basis::Basis, fock; periodic = false)
 
     if periodic == true && fock[basis.L] > 0
         copy_fock .= copy(fock)
-        copy_fock[L] -= 1
+        copy_fock[basis.L] -= 1
         copy_fock[1] += 1
         if find_index(basis, fock) <= length(basis)
             push!(focks_out, copy(copy_fock))
