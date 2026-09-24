@@ -141,7 +141,7 @@ function hops(basis::Basis, fock; periodic = false)
         copy_fock[1] += 1
         if find_index(basis, fock) <= length(basis)
             push!(focks_out, copy(copy_fock))
-            push!(elements, sqrt(fock[L] * copy_fock[1]))
+            push!(elements, sqrt(fock[basis.L] * copy_fock[1]))
         end
     end
 
