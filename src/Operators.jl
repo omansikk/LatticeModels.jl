@@ -313,7 +313,7 @@ For a rectangular 2D array, set `dims = (L1, L2)`, where `L1` and `L2` are the l
 """
 function ABH_Hamiltonian(basis::Basis; periodic = false, split = true, J = 1, U = 1, dims::Tuple{Int64, Int64} = (0, 0))
     HU = anharmonicity(basis, U = U)
-    HJ = hopping(basis::Basis; periodic = periodic, J = 1, dims = dims)
+    HJ = hopping(basis::Basis; periodic = periodic, J = J, dims = dims)
 
     if split == true
         return HU, HJ
