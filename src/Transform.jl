@@ -1,134 +1,137 @@
-using LinearAlgebra, Multisets, Combinatorics
+using LinearAlgebra
 
-function number_of_multiset_permutations(vector)
-    m = Multiset(vector)
-    s = unique(vector)
-    n = factorial(length(vector))
-    for i in s
-        n /= factorial(m[i])
-    end
-    
-    return n
+
+struct _ModeRotation{T<:Number}
+    p::Int
+    q::Int
+    matrix::Matrix{T}
+    blocks::Dict{Int,Matrix{T}}
 end
 
 
-function get_sites(input, output)
-    js = Int64[]
-    ks = Int64[]
-    c = 1.
-    for k in 1:length(input)
-        if input[k] != 0
-            c *= sqrt(factorial(input[k]))
-            for l in 1:input[k]
-                push!(js, k)
-            end
-        end
-
-        if output[k] != 0
-            c *= sqrt(factorial(output[k]))
-            for l in 1:output[k]
-                push!(ks, k)
-            end
-        end
-    end
-    
-    return c, js, ks
+struct _ModeTransformPlan{T<:Number}
+    rotations::Vector{_ModeRotation{T}}
+    phases::Vector{T}
 end
 
 
-
-
-"""
-transform(basis::Basis; periodic = false)
-
-Construct a matrix representation of transformation to the basis of the hopping term. 
-
-NB this is essentially the old-timey Fourier transform and gets really slow with even moderate system sizes. Probably should be replaced by something like FFT.
-"""
-function transform(basis::Basis; periodic = false)
-    dim = length(basis)
-    T = zeros(dim, dim)
-    if periodic == false
-        Lp1 = 1. / (basis.L + 1)
-        for i in 1:dim
-            for j in i:dim
-                c, js, ks = get_sites(basis[i], basis[j])
-                c *= number_of_multiset_permutations(js)
-                for output in multiset_permutations(ks, basis.N)
-                    Tij = c
-                    for l in 1:basis.N
-                        Tij *= sin(pi * js[l] * output[l] * Lp1)
-                    end
-
-                    T[i, j] += Tij
-                end
-            end
-        end
-
-#~      n = (sqrt((L + 1) / 2) ^ N * factorial(N))
-    else
-        T = zeros(ComplexF64, dim, dim)
-        Lp1 = 1. / (L)
-        for i in 1:dim
-            for j in i:dim
-                c, js, ks = get_sites(basis[i], basis[j])
-                c *= number_of_multiset_permutations(js)
-                for output in multiset_permutations(ks, N)
-                    Tij = c
-                    for l in 1:basis.N
-                        Tij *= exp(-2 * im * pi * js[l] * output[l] * Lp1)
-                    end
-
-                    T[i, j] += Tij
-                end
-            end
-        end
-
-    #~     n = (sqrt((L + 1) / 2) ^ N * factorial(N))
+function _single_particle_modes(L::Integer, periodic::Bool)
+    if periodic
+        return [cispi(2 * l * k / L) / sqrt(L) for l in 1:L, k in 1:L]
     end
+    
+    return [sqrt(2 / (L + 1)) * sinpi(l * k / (L + 1)) for l in 1:L, k in 1:L]
+end
+
+
+function _mode_transform_plan(basis::Union{Basis_constant_N,Basis_global_max_N}; periodic::Bool = false,
+                              modes::Union{Nothing,AbstractMatrix{<:Number}} = nothing, inverse::Bool = false)
+                              
+    S = modes === nothing ? _single_particle_modes(basis.L, periodic) : modes
+    T = eltype(S) <: Real ? Float64 : ComplexF64
+    A = Matrix{T}(inverse ? S : S')
+    rotations = _ModeRotation{T}[]
+    rowp, rowq = zeros(T, basis.L), zeros(T, basis.L)
+    for j in 1:basis.L-1, i in basis.L:-1:j+1
+        p, q = i - 1, i
+        x, y = A[p, j], A[q, j]
+        r = hypot(abs(x), abs(y))
+        (iszero(r) || abs(y) <= eps(Float64) * r) && continue
+        g = T[conj(x)/r conj(y)/r; -y/r x/r]
+        copyto!(rowp, @view(A[p, :]))
+        copyto!(rowq, @view(A[q, :]))
+        @views A[p, :] .= g[1, 1] .* rowp .+ g[1, 2] .* rowq
+        @views A[q, :] .= g[2, 1] .* rowp .+ g[2, 2] .* rowq
+        push!(rotations, _ModeRotation(p, q, Matrix(g'), Dict{Int,Matrix{T}}()))
+    end
+    
+    return _ModeTransformPlan(rotations, collect(diag(A)))
+end
+
+
+function _two_mode_block(g::AbstractMatrix{T}, particles::Integer) where {T<:Number}
+    previous = ones(T, 1, 1)
+    for m in 1:particles
+        block = zeros(T, m + 1, m + 1)
+        for j in 0:m
+            source = j == m ? 2 : 1
+            column = min(j, m - 1) + 1
+            normalization = sqrt(j == m ? m : m - j)
+            for k in 0:m-1
+                amplitude = previous[k + 1, column] / normalization
+                block[k + 1, j + 1] += g[1, source] * sqrt(m - k) * amplitude
+                block[k + 2, j + 1] += g[2, source] * sqrt(k + 1) * amplitude
+            end
+        end
         
-    n = norm(T[1, :])
-    T ./= n
+        previous = block
+    end
     
-    return Symmetric(T)
+    return previous
 end
 
 
-#~ function transform_periodic(L, N)
-#~     input_vector = zeros(Int64, L)
-#~     input_vector[1] = N
-#~     dim = dimension(L, N)
-#~     T = zeros(ComplexF64, dim, dim)
-#~     Lp1 = 1. / (L)
-#~     for i in 1:dim
-#~         if i != 1
-#~             next!(input_vector)
-#~         end
+function _apply_mode_plan!(state::AbstractVector{<:Number}, basis::Union{Basis_constant_N,Basis_global_max_N},
+                           plan::_ModeTransformPlan, indices::Vector{Int}, buffer::AbstractVector{<:Number})
+                           
+    for i in 1:length(basis)
+        fock = find_vector(basis, i)
+        phase = one(eltype(plan.phases))
+        for l in eachindex(fock)
+            phase *= plan.phases[l]^fock[l]
+        end
+        
+        state[i] *= phase
+    end
     
-#~         output_vector = copy(input_vector)
-#~         for j in i:dim
-#~             if j != i
-#~                 next!(output_vector)
-#~             end
+    for rotation in Iterators.reverse(plan.rotations)
+        p, q = rotation.p, rotation.q
+        for i in 1:length(basis)
+            fock = find_vector(basis, i)
+            fock[q] == 0 || continue 
+            m = fock[p]
+            m == 0 && continue
+            for j in 0:m
+                fock[p], fock[q] = m - j, j
+                indices[j + 1] = find_index(basis, fock)
+                buffer[j + 1] = state[indices[j + 1]]
+            end
             
-#~             c, js, ks = get_sites(input_vector, output_vector)
-#~             c *= number_of_multiset_permutations(js)
-#~ #            println(i, " ", j)
-#~             for output in multiset_permutations(ks, N)
-#~                 Tij = c
-#~                 for l in 1:N
-#~                     Tij *= exp(-2 * im * pi * js[l] * output[l] * Lp1)
-#~                 end
+            all(iszero, @view(buffer[1:m+1])) && continue
+            block = get!(rotation.blocks, m) do
+                _two_mode_block(rotation.matrix, m)
+            end
+            
+            for row in 1:m+1
+                value = zero(eltype(state))
+                for column in 1:m+1
+                    value += block[row, column] * buffer[column]
+                end
+                
+                state[indices[row]] = value
+            end
+        end
+    end
+    
+    return state
+end
 
-#~                 T[i, j] += Tij
-#~ #                println(js, " ", output, " ", Tij)
-#~             end
-#~         end
-#~     end
 
-#~     n = norm(T[1, :])
-#~     n = (sqrt((L + 1) / 2) ^ N * factorial(N))
-#~     T ./= n
-#~     return Hermitian(T)
-#~     return Symmetric(T)
-#~ end
+"""
+    transform(basis, state; periodic = false, modes = nothing, inverse = false)
+
+Supports only `Basis_constant_N` and `Basis_global_max_N`.
+"""
+function transform(basis::Union{Basis_constant_N,Basis_global_max_N}, state::AbstractVector{<:Number};
+                   periodic::Bool = false, modes::Union{Nothing,AbstractMatrix{<:Number}} = nothing, inverse::Bool = false)
+                   
+    plan = _mode_transform_plan(basis; periodic, modes, inverse)
+    T = promote_type(eltype(state), eltype(plan.phases), Float64)
+    result = Vector{T}(state)
+    indices = zeros(Int, basis.N + 1)
+    buffer = zeros(T, basis.N + 1)
+    
+    return _apply_mode_plan!(result, basis, plan, indices, buffer)
+end
+
+

@@ -1,21 +1,18 @@
 module LatticeModels
-    include.(["Basis.jl", "Operators.jl", "Trajectories.jl", "Miscellaneous_quantities.jl", "Transform.jl"])
+    include.(["Basis.jl", "Operators.jl", "Propagation.jl", "Unitary.jl", "Lindblad.jl", "Trajectories.jl", "Miscellaneous_quantities.jl", "Transform.jl"])
     
     # from Basis.jl
     export Basis_constant_N, Basis_global_max_N, Basis_local_max_N, Basis_composite, Basis
     export dimension, length, find_vector, find_index, product_state, print_state
     
     # from Operators.jl
-    export operator, diagonal_operator
+    export operator, diagonal_operator, transformation_operator
     export number, numbers, annihilation, annihilations
     export ABH_Hamiltonian, hopping, anharmonicity
     export number_disorder, anharmonicity_disorder
     
-    # from Trajectories.jl
-    export run_trajectories
-    export init_work_arrays, set_timing_parameters, set_krylov_dimension, init_output_array
-    export unitary_trajectory, nonunitary_trajectory
-    export run_unitary_trajectories, run_nonunitary_trajectories
+    # from Unitary.jl, Lindblad.jl, and Trajectories.jl
+    export run_unitary, run_lindblad, liouvillian, run_trajectories
     
     # from Miscellaneous_quantities.jl
     export inverse_participation_ratio, entropy
