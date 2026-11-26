@@ -93,11 +93,13 @@ function liouvillian(H::AbstractMatrix{<:Number}, jump_operators = (); represent
 end
 
 
-struct _LindbladModel{H,C,D,G} <: _EvolutionModel
+struct _LindbladModel{H,C,D,G,S,B} <: _EvolutionModel
     hamiltonian::H
     jumps::C
     products::D
     generator::G
+    dissipator::S
+    buffer::B
     dimension::Int
     representation::Symbol
     workspace::_LindbladWorkspace
@@ -118,8 +120,34 @@ function _lindblad_model(H, jump_operators, dim::Integer, representation::Symbol
     products = dynamic_jumps ? nothing : [C' * C for C in jumps]
     workspace = _LindbladWorkspace(dim)
     generator = H isa AbstractMatrix && !dynamic_jumps ? _lindblad_generator(H0, initial_jumps, products, representation, workspace) : nothing
+    dissipator = !(H isa AbstractMatrix) && !dynamic_jumps && !isempty(initial_jumps) && representation != :matrixfree ?
+                 _explicit_liouvillian(spzeros(ComplexF64, dim, dim), initial_jumps, products, representation) : nothing
     
-    return _LindbladModel(H, jumps, products, generator, dim^2, representation, workspace)
+    buffer = !(H isa AbstractMatrix) && !dynamic_jumps && representation == :dense ? Matrix{ComplexF64}(undef, dim^2, dim^2) : nothing
+    
+    return _LindbladModel(H, jumps, products, generator, dissipator, buffer, dim^2, representation, workspace)
+end
+
+
+function _commutator_generator!(destination::Matrix{ComplexF64}, H::AbstractMatrix{<:Number}, dissipator)
+    dim = size(H, 1)
+    size(H, 2) == dim || throw(DimensionMismatch("Hamiltonian must be square"))
+    size(destination) == (dim^2, dim^2) || throw(DimensionMismatch("Liouvillian buffer must match the Hamiltonian"))
+    if dissipator === nothing
+        fill!(destination, 0)
+    else
+        copyto!(destination, dissipator)
+    end
+
+    @inbounds for j in 1:dim, k in 1:dim
+        coefficient = 1im * H[k, j]
+        for i in 1:dim
+            destination[i + (j - 1) * dim, i + (k - 1) * dim] += coefficient
+            destination[k + (i - 1) * dim, j + (i - 1) * dim] -= coefficient
+        end
+    end
+    
+    return destination
 end
 
 
@@ -127,6 +155,14 @@ function _generator(model::_LindbladModel, t::Real)
     model.generator !== nothing && return model.generator
     dim = size(model.workspace.left, 1)
     H = _checked_hamiltonian(model.hamiltonian isa AbstractMatrix ? model.hamiltonian : model.hamiltonian(t), dim)
+    model.buffer !== nothing && return _commutator_generator!(model.buffer, H, model.dissipator)
+    if model.dissipator !== nothing
+        generator = _explicit_liouvillian(H, (), (), model.representation)
+        generator .+= model.dissipator
+        
+        return generator
+    end
+    
     dynamic_jumps = model.products === nothing
     jumps = dynamic_jumps ? _checked_jumps(model.jumps(t), dim) : model.jumps
     products = dynamic_jumps ? [C' * C for C in jumps] : model.products
