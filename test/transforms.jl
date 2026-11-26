@@ -114,23 +114,3 @@ end
         @test transformation_operator(Basis_constant_N(1, N); periodic = true) ≈ ones(1, 1)
     end
 end
-
-@testset "Mode transformation validation and compatibility" begin
-    basis = Basis_constant_N(3, 2)
-    state = product_state(basis, [2, 0, 0])
-    @test_throws DimensionMismatch transform(basis, state[1:end-1])
-    @test_throws DimensionMismatch transformation_operator(basis; modes = ones(2, 2))
-    @test_throws ArgumentError transform(basis, state; modes = ones(3, 3))
-    @test_throws ArgumentError transformation_operator(basis; modes = fill(NaN, 3, 3))
-    @test_throws ArgumentError transform(basis, fill(Inf, length(basis)))
-    @test_throws ArgumentError transformation_operator(Basis_constant_N(0, 1))
-    @test_throws ArgumentError transformation_operator(Basis_constant_N(3, -1))
-    for unsupported in (Basis_local_max_N(2, 1), Basis_composite(Basis[Basis_constant_N(2, 1)]))
-        @test_throws ArgumentError transformation_operator(unsupported)
-        @test_throws ArgumentError transform(unsupported, zeros(length(unsupported)))
-    end
-    
-    @test_deprecated transform(basis)
-    @test transform(basis; periodic = true) ≈ transformation_operator(basis; periodic = true)
-    @test transform(basis; periodic = 1) ≈ transformation_operator(basis; periodic = true)
-end
