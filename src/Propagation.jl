@@ -4,8 +4,21 @@ using LinearAlgebra, SparseArrays
 abstract type _EvolutionModel end
 abstract type _Propagation end
 
+struct _StepBuffers
+    full::Vector{ComplexF64}
+    refined::Vector{ComplexF64}
+    halfway::Vector{ComplexF64}
+    trial::Vector{ComplexF64}
+    event::Vector{ComplexF64}
+    observed::Vector{ComplexF64}
+end
+
+_StepBuffers(dim::Integer) = _StepBuffers((zeros(ComplexF64, dim) for i in 1:6)...)
+
 mutable struct _DensePropagation <: _Propagation
     exponentials::Dict{Float64,Matrix{ComplexF64}}
+    scaled::Matrix{ComplexF64}
+    steps::_StepBuffers
 end
 
 
@@ -13,6 +26,8 @@ mutable struct _ArnoldiPropagation <: _Propagation
     vectors::Matrix{ComplexF64}
     projection::Matrix{ComplexF64}
     residual::Vector{ComplexF64}
+    scaled::Matrix{ComplexF64}
+    steps::_StepBuffers
 end
 
 
@@ -42,35 +57,42 @@ function _propagation_workspace(model::_EvolutionModel, method::Symbol, krylov_d
     generator = _generator(model, 0.0)
     method == :dense && !(generator isa AbstractMatrix) && throw(ArgumentError("dense propagation requires an explicit generator; select representation = :dense or :sparse"))
     use_krylov = method == :krylov || (method == :auto && (!(generator isa AbstractMatrix) || issparse(generator)))
+    dim = model.dimension
+    steps = _StepBuffers(dim)
     if use_krylov
-        dim = model.dimension
         m = krylov_dimension == 0 ? min(30, dim) : min(krylov_dimension, dim)
         m >= min(2, dim) || throw(ArgumentError("Krylov dimension must be at least min(2, state dimension)"))
-        return _ArnoldiPropagation(zeros(ComplexF64, dim, m + 1), zeros(ComplexF64, m + 1, m), zeros(ComplexF64, dim))
+        return _ArnoldiPropagation(zeros(ComplexF64, dim, m + 1), zeros(ComplexF64, m + 1, m), zeros(ComplexF64, dim), zeros(ComplexF64, m, m), steps)
     end
     
-    return _DensePropagation(Dict{Float64,Matrix{ComplexF64}}())
+    return _DensePropagation(Dict{Float64,Matrix{ComplexF64}}(), zeros(ComplexF64, dim, dim), steps)
 end
 
 
-function _exponential_action(generator::AbstractMatrix{<:Number}, state::Vector{ComplexF64}, h::Float64, work::_DensePropagation, cache::Bool)
+function _exponential_action!(destination::Vector{ComplexF64}, generator::AbstractMatrix{<:Number},
+    state::Vector{ComplexF64}, h::Float64, work::_DensePropagation, cache::Bool)
     if !cache
-        return exp(h * Matrix(generator)) * state
+        work.scaled .= h .* generator
+        exponential = LinearAlgebra.exp!(work.scaled)
+        return mul!(destination, exponential, state)
     end
     
     cache_limit = max(1, min(8, (64 * 1024^2) ÷ (sizeof(ComplexF64) * length(generator))))
     length(work.exponentials) >= cache_limit && !haskey(work.exponentials, h) && empty!(work.exponentials)
     exponential = get!(work.exponentials, h) do
-        exp(h * Matrix(generator))
+        scaled = Matrix{ComplexF64}(undef, size(generator))
+        scaled .= h .* generator
+        LinearAlgebra.exp!(scaled)
     end
     
-    return exponential * state
+    return mul!(destination, exponential, state)
 end
 
 
-function _exponential_action(generator, state::Vector{ComplexF64}, h::Float64, work::_ArnoldiPropagation, cache::Bool)
+function _exponential_action!(destination::Vector{ComplexF64}, generator, state::Vector{ComplexF64},
+    h::Float64, work::_ArnoldiPropagation, cache::Bool)
     beta = norm(state)
-    iszero(beta) && return copy(state)
+    iszero(beta) && return copyto!(destination, state)
     V, P, residual = work.vectors, work.projection, work.residual
     fill!(P, 0)
     V[:, 1] .= state ./ beta
@@ -95,35 +117,44 @@ function _exponential_action(generator, state::Vector{ComplexF64}, h::Float64, w
         V[:, j + 1] .= residual ./ remainder
     end
     
-    exponential = exp(h .* @view(P[1:used, 1:used]))
-    result = @view(V[:, 1:used]) * @view(exponential[:, 1])
-    result .*= beta
+    scaled = @view(work.scaled[1:used, 1:used])
+    scaled .= h .* @view(P[1:used, 1:used])
+    exponential = LinearAlgebra.exp!(scaled)
     
-    return result
+    return mul!(destination, @view(V[:, 1:used]), @view(exponential[:, 1]), beta, 0)
+end
+
+function _exponential_action(generator, state::Vector{ComplexF64}, h::Float64, work::_Propagation, cache::Bool)
+    return _exponential_action!(similar(state), generator, state, h, work, cache)
 end
 
 
-function _midpoint_step(model::_EvolutionModel, state::Vector{ComplexF64}, t::Float64, h::Float64, work::_Propagation)
-    return _exponential_action(_generator(model, t + h / 2), state, h, work, model.generator !== nothing)
+function _midpoint_step!(destination::Vector{ComplexF64}, model::_EvolutionModel, state::Vector{ComplexF64},
+    t::Float64, h::Float64, work::_Propagation)
+    
+    return _exponential_action!(destination, _generator(model, t + h / 2), state, h, work, model.generator !== nothing)
 end
 
 
-function _two_half_steps(model::_EvolutionModel, state::Vector{ComplexF64}, t::Float64, h::Float64, work::_Propagation)
-    halfway = _midpoint_step(model, state, t, h / 2, work)
-    return _midpoint_step(model, halfway, t + h / 2, h / 2, work)
+function _two_half_steps!(destination::Vector{ComplexF64}, model::_EvolutionModel, state::Vector{ComplexF64},
+    t::Float64, h::Float64, work::_Propagation)
+    halfway = work.steps.halfway
+    _midpoint_step!(halfway, model, state, t, h / 2, work)
+    
+    return _midpoint_step!(destination, model, halfway, t + h / 2, h / 2, work)
 end
 
 
-function _accepted_step(model::_EvolutionModel, state::Vector{ComplexF64}, t::Float64, h::Float64, 
-                        work::_Propagation, atol::Real, rtol::Real; contractive::Bool = false)
-                        
+function _accepted_step(model::_EvolutionModel, state::Vector{ComplexF64}, t::Float64, h::Float64,
+    work::_Propagation, atol::Real, rtol::Real; contractive::Bool = false)
+    full, refined = work.steps.full, work.steps.refined
     if model.generator !== nothing && work isa _DensePropagation
-        return _midpoint_step(model, state, t, h, work), h, 2h
+        return _midpoint_step!(refined, model, state, t, h, work), h, 2h
     end
     
     for attempt in 1:60
-        full = _midpoint_step(model, state, t, h, work)
-        refined = _two_half_steps(model, state, t, h, work)
+        _midpoint_step!(full, model, state, t, h, work)
+        _two_half_steps!(refined, model, state, t, h, work)
         tolerance = atol + rtol * max(norm(state), norm(refined))
         full .-= refined
         error = norm(full)
@@ -136,6 +167,50 @@ function _accepted_step(model::_EvolutionModel, state::Vector{ComplexF64}, t::Fl
     end
     
     throw(ErrorException("propagation failed to converge"))
+end
+
+
+function _next_step_size(proposed::Float64, requested::Float64, accepted::Float64, suggested::Float64)
+    return requested < proposed && accepted == requested ? max(proposed, suggested) : suggested
+end
+
+
+function _observed_state(state::Vector{ComplexF64}, state_view, work::_Propagation)
+    state_view === normalize || return state_view(state)
+    copyto!(work.steps.observed, state)
+    return normalize!(work.steps.observed)
+end
+
+
+_generator_buffer(H::StridedMatrix{<:Number}) = Matrix{ComplexF64}(undef, size(H))
+_generator_buffer(H::SparseMatrixCSC{<:Number}) = spzeros(ComplexF64, size(H)...)
+_generator_buffer(H::AbstractMatrix{<:Number}) = nothing
+
+function _reuse_generator!(buffer, H::AbstractMatrix{<:Number}, scale::Number, offset)
+    return offset === nothing ? scale * H : scale * H + offset
+end
+
+
+function _reuse_generator!(buffer::Matrix{ComplexF64}, H::StridedMatrix{<:Number}, scale::Number, offset)
+    if offset === nothing
+        buffer .= scale .* H
+    else
+        buffer .= scale .* H .+ offset
+    end
+    
+    return buffer
+end
+
+
+function _reuse_generator!(buffer::SparseMatrixCSC{ComplexF64,Int}, H::SparseMatrixCSC{<:Number}, scale::Number,
+    offset::Union{Nothing,SparseMatrixCSC})
+    if offset === nothing
+        buffer .= scale .* H
+    else
+        buffer .= scale .* H .+ offset
+    end
+    
+    return buffer
 end
 
 
@@ -221,21 +296,24 @@ function _deterministic_evolution(model::_EvolutionModel, initial::Vector{Comple
     states = store_states ? [copy(state_view(state))] : nothing
     t = 0.0
     iterations = 0
+    next_h = options.dt
     for save in 2:length(times)
         target = times[save]
-        next_h = options.dt
         while t < target
             iterations += 1
             iterations <= options.max_steps || throw(ErrorException("maximum propagation steps exceeded"))
-            h = min(next_h, options.dt, target - t)
-            state, accepted_h, next_h = _accepted_step(model, state, t, h, work, options.atol, options.rtol)
+            proposed = min(next_h, options.dt)
+            h = min(proposed, target - t)
+            candidate, accepted_h, suggested = _accepted_step(model, state, t, h, work, options.atol, options.rtol)
+            next_h = _next_step_size(proposed, h, accepted_h, suggested)
+            copyto!(state, candidate)
             t = accepted_h == target - t ? target : t + accepted_h
         end
         
-        observed = state_view(state)
+        observed = _observed_state(state, state_view, work)
         _record_outputs!(outputs, callbacks, observed, target, save)
         store_states && push!(states, copy(observed))
     end
     
-    return (; times, outputs, final_state = copy(state_view(state)), states)
+    return (; times, outputs, final_state = copy(_observed_state(state, state_view, work)), states)
 end
