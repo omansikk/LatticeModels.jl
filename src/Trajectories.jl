@@ -2,10 +2,12 @@
 
 using Distributed, Random
 
-struct _TrajectoryModel{H,J,G} <: _EvolutionModel
+struct _TrajectoryModel{H,J,G,D,B} <: _EvolutionModel
     hamiltonian::H
     jumps::J
     generator::G
+    decay::D
+    buffer::B
     dimension::Int
 end
 
@@ -13,7 +15,7 @@ end
 function _effective_generator(H::AbstractMatrix{<:Number}, jumps)
     generator = -1im * H
     for C in jumps
-        generator = generator - 0.5 * (C' * C)
+        generator .-= 0.5 .* (C' * C)
     end
     
     return generator
@@ -26,8 +28,9 @@ function _trajectory_model(H, jumps, dim::Integer)
     C0 = _checked_jumps(dynamic_jumps ? jumps(0.0) : jumps, dim)
     Cs = dynamic_jumps ? jumps : C0
     generator = H isa AbstractMatrix && !dynamic_jumps ? _effective_generator(H0, C0) : nothing
+    decay = !(H isa AbstractMatrix) && !dynamic_jumps && !isempty(C0) ? _effective_generator(spzeros(ComplexF64, dim, dim), C0) : nothing
     
-    return _TrajectoryModel(H, Cs, generator, dim)
+    return _TrajectoryModel(H, Cs, generator, decay, H isa AbstractMatrix ? nothing : _generator_buffer(H0), dim)
 end
 
 
@@ -36,8 +39,14 @@ _jump_operators(model::_TrajectoryModel, t::Real) = applicable(model.jumps, t) ?
 function _generator(model::_TrajectoryModel, t::Real)
     model.generator !== nothing && return model.generator
     H = model.hamiltonian isa AbstractMatrix ? model.hamiltonian : model.hamiltonian(t)
+    H = _checked_hamiltonian(H, model.dimension)
+    model.decay !== nothing && return _reuse_generator!(model.buffer, H, -1im, model.decay)
     
-    return _effective_generator(_checked_hamiltonian(H, model.dimension), _jump_operators(model, t))
+    if !applicable(model.jumps, t) && isempty(model.jumps)
+        return _reuse_generator!(model.buffer, H, -1im, nothing)
+    end
+    
+    return _effective_generator(H, _jump_operators(model, t))
 end
 
 
@@ -45,13 +54,14 @@ function _locate_jump(model::_TrajectoryModel, state::Vector{ComplexF64}, candid
                       t::Float64, h::Float64, threshold::Float64, work::_Propagation, jump_tol::Real)
                       
     lo, hi = 0.0, h
-    event_state = candidate
+    event_state = copyto!(work.steps.event, candidate)
     for iteration in 1:80
         hi - lo <= jump_tol * max(1.0, abs(t + hi)) && break
         midpoint = (lo + hi) / 2
-        trial = _two_half_steps(model, state, t, midpoint, work)
+        trial = _two_half_steps!(work.steps.trial, model, state, t, midpoint, work)
         if sum(abs2, trial) <= threshold
-            hi, event_state = midpoint, trial
+            hi = midpoint
+            copyto!(event_state, trial)
         else
             lo = midpoint
         end
@@ -93,27 +103,30 @@ function _trajectory(H, jumps, initial::Vector{ComplexF64}, callbacks, times::Ve
     threshold = rand(rng)
     t = 0.0
     iterations = 0
+    next_h = options.dt
     for save in 2:length(times)
         target = times[save]
-        next_h = options.dt
         while t < target
             iterations += 1
             iterations <= options.max_steps || throw(ErrorException("maximum propagation steps exceeded"))
-            h = min(next_h, options.dt, target - t)
-            candidate, accepted_h, next_h = _accepted_step(model, state, t, h, work, options.atol, options.rtol; contractive = true)
+            proposed = min(next_h, options.dt)
+            h = min(proposed, target - t)
+            candidate, accepted_h, suggested = _accepted_step(model, state, t, h, work, options.atol, options.rtol; contractive = true)
+            next_h = _next_step_size(proposed, h, accepted_h, suggested)
             if has_jumps && sum(abs2, candidate) <= threshold
                 candidate, event_h = _locate_jump(model, state, candidate, t, accepted_h, threshold, work, options.jump_tol)
-                state = _apply_jump(candidate, _jump_operators(model, t + event_h), rng)
+                state .= _apply_jump(candidate, _jump_operators(model, t + event_h), rng)
                 t += event_h
+                next_h = min(options.dt, accepted_h)
                 threshold = rand(rng)
             else
-                state = candidate
+                state .= candidate
                 has_jumps || normalize!(state)
                 t = accepted_h == target - t ? target : t + accepted_h
             end
         end
         
-        observed = normalize(state)
+        observed = _observed_state(state, normalize, work)
         _record_outputs!(outputs, callbacks, observed, target, save)
     end
     
@@ -121,11 +134,22 @@ function _trajectory(H, jumps, initial::Vector{ComplexF64}, callbacks, times::Ve
 end
 
 
+function _accumulate_output!(mean::Vector{<:Number}, deviation::Vector{<:Real}, value::Vector{<:Number}, count::Integer)
+    axes(mean) == axes(deviation) == axes(value) || throw(DimensionMismatch("output arrays must have matching axes"))
+    @inbounds @simd for i in eachindex(mean)
+        delta = value[i] - mean[i]
+        mean[i] += delta / count
+        deviation[i] += real(conj(delta) * (value[i] - mean[i]))
+    end
+    
+    return nothing
+end
+
+
 function _accumulate_outputs!(means, deviations, values, count::Integer)
-    for k in eachindex(means), i in eachindex(means[k])
-        delta = values[k][i] - means[k][i]
-        means[k][i] += delta / count
-        deviations[k][i] += real(conj(delta) * (values[k][i] - means[k][i]))
+    axes(means) == axes(deviations) == axes(values) || throw(DimensionMismatch("output collections must have matching axes"))
+    for k in eachindex(means)
+        _accumulate_output!(means[k], deviations[k], values[k], count)
     end
     
     return nothing
