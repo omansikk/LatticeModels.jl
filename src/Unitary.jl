@@ -1,6 +1,7 @@
-struct _UnitaryModel{H,G} <: _EvolutionModel
+struct _UnitaryModel{H,G,B} <: _EvolutionModel
     hamiltonian::H
     generator::G
+    buffer::B
     dimension::Int
 end
 
@@ -8,14 +9,14 @@ end
 function _unitary_model(H, dim::Integer)
     H0 = _checked_hamiltonian(H isa AbstractMatrix ? H : H(0.0), dim)
     
-    return _UnitaryModel(H, H isa AbstractMatrix ? -1im * H0 : nothing, dim)
+    return _UnitaryModel(H, H isa AbstractMatrix ? -1im * H0 : nothing, H isa AbstractMatrix ? nothing : _generator_buffer(H0), dim)
 end
 
 
 function _generator(model::_UnitaryModel, t::Real)
     model.generator !== nothing && return model.generator
     
-    return -1im * _checked_hamiltonian(model.hamiltonian(t), model.dimension)
+    return _reuse_generator!(model.buffer, _checked_hamiltonian(model.hamiltonian(t), model.dimension), -1im, nothing)
 end
 
 
